@@ -1,0 +1,13 @@
+{
+  "name": "email-verification-service",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "fastify": "^5.3.3"
+  }
+}
