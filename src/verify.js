@@ -112,9 +112,10 @@ class DomainLimiter {
  * @param {Semaphore} options.semaphore
  * @param {DomainLimiter} options.domainLimiter
  * @param {typeof console} options.logger
+ * @param {Map<string, boolean>} [options.catchAllDomainCache] - Shared across the batch. Values: true=catch-all, false=not.
  * @returns {Promise<VerificationResult>}
  */
-async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimiter, logger }) {
+async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimiter, logger, catchAllDomainCache }) {
   const baseResult = {
     email,
     status: /** @type {const} */ ('unknown'),
@@ -144,7 +145,9 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
   try {
     mxRecords = await dns.resolveMx(domain)
   } catch (err) {
-    logger.info(`[${email}] No MX records for ${domain}: ${err.message}`)
+    logger.info(
+      `[${email}] No MX records for ${domain}: ${err instanceof Error ? err.message : String(err)}`,
+    )
     return { ...baseResult, status: 'invalid' }
   }
 
@@ -195,7 +198,17 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
     return { ...baseResult, status: 'unknown' }
   }
 
-  // Step 5: Catch-all detection
+  // Step 5: Catch-all detection (cached per-batch when possible).
+  if (catchAllDomainCache?.has(domain)) {
+    const isCatchAll = catchAllDomainCache.get(domain)
+    if (isCatchAll) {
+      logger.info(`[${email}] Catch-all domain (cached)`)
+      return { ...baseResult, status: 'catch-all', is_catch_all: true }
+    }
+    logger.info(`[${email}] Valid (catch-all cache miss)`)
+    return { ...baseResult, status: 'valid' }
+  }
+
   const gibberish = crypto.randomBytes(8).toString('hex') + '@' + domain
   logger.info(`[${email}] Catch-all check with ${gibberish}`)
 
@@ -210,7 +223,10 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
     semaphore.release()
   }
 
-  if (catchAllResult.responseCode === 250) {
+  const isCatchAll = catchAllResult.responseCode === 250
+  if (catchAllDomainCache) catchAllDomainCache.set(domain, isCatchAll)
+
+  if (isCatchAll) {
     logger.info(`[${email}] Catch-all domain detected`)
     return { ...baseResult, status: 'catch-all', is_catch_all: true }
   }
@@ -227,6 +243,7 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
  * @param {string} [options.mailFrom]
  * @param {number} [options.maxConcurrency]
  * @param {typeof console} [options.logger]
+ * @param {Map<string, boolean>} [options.catchAllDomainCache] - Shared across calls within one batch for per-domain catch-all memoization.
  * @returns {Promise<VerificationResult[]>}
  */
 export async function verifyEmails(emails, options = {}) {
@@ -235,6 +252,7 @@ export async function verifyEmails(emails, options = {}) {
     mailFrom = process.env.MAIL_FROM_ADDRESS || 'verify@mx-verify.com',
     maxConcurrency = parseInt(process.env.MAX_CONCURRENCY || '10', 10),
     logger = console,
+    catchAllDomainCache,
   } = options
 
   const semaphore = new Semaphore(maxConcurrency)
@@ -248,6 +266,7 @@ export async function verifyEmails(emails, options = {}) {
         semaphore,
         domainLimiter,
         logger,
+        catchAllDomainCache,
       })
     )
   )

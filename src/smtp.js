@@ -43,7 +43,7 @@ function smtpCommand(socket, command, timeout) {
       if (!settled) {
         settled = true
         cleanup()
-        resolve({ code: null, message: err.message })
+        resolve({ code: null, message: err instanceof Error ? err.message : String(err) })
       }
     }
 
@@ -150,7 +150,7 @@ export async function smtpVerify({
 
     return { responseCode: rcptTo.code, rawResponse: rcptTo.message }
   } catch (err) {
-    return { responseCode: null, rawResponse: err.message }
+    return { responseCode: null, rawResponse: err instanceof Error ? err.message : String(err) }
   } finally {
     if (socket) {
       socket.destroy()
