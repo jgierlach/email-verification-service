@@ -55,13 +55,26 @@ class Semaphore {
 class DomainLimiter {
   /**
    * @param {number} maxPerDomain
-   * @param {number} delayMs
+   * @param {number} delayMs - Nominal delay between connections to the same MX.
+   * @param {number} jitterPct - Random ±% variation applied to `delayMs`. Defeats
+   *   timing-pattern fingerprinting that rate-limit systems sometimes watch for.
    */
-  constructor(maxPerDomain = 3, delayMs = 2000) {
+  constructor(maxPerDomain = 2, delayMs = 4000, jitterPct = 0.25) {
     this.maxPerDomain = maxPerDomain
     this.delayMs = delayMs
-    /** @type {Map<string, { active: number, lastConnection: number, queue: Array<() => void> }>} */
+    this.jitterPct = jitterPct
+    /**
+     * @type {Map<string, { active: number, lastConnection: number, queue: Array<() => void> }>}
+     * `active` counts callers past the concurrency gate, including any awaiting the inter-connect delay.
+     */
     this.domains = new Map()
+  }
+
+  /** Randomized delay within ±jitterPct of the nominal. */
+  _jitteredDelay() {
+    if (this.jitterPct <= 0) return this.delayMs
+    const factor = 1 + (Math.random() * 2 - 1) * this.jitterPct
+    return Math.max(0, Math.floor(this.delayMs * factor))
   }
 
   /** @param {string} domain */
@@ -72,22 +85,35 @@ class DomainLimiter {
 
     const state = this.domains.get(domain)
 
-    // Wait if at max concurrent connections for this domain
-    if (state.active >= this.maxPerDomain) {
+    // Wait if at max concurrent "slots" for this domain (reserved before delay — see below).
+    while (state.active >= this.maxPerDomain) {
       await new Promise((resolve) => {
         state.queue.push(resolve)
       })
     }
 
-    // Enforce delay between connections to the same MX
-    const now = Date.now()
-    const elapsed = now - state.lastConnection
-    if (elapsed < this.delayMs && state.lastConnection > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.delayMs - elapsed))
-    }
-
+    // Reserve a slot before any further `await`. Otherwise many tasks could pass the check
+    // while `active` is still low, all sleep on the delay in parallel, then each increment and
+    // blow past `maxPerDomain`.
     state.active++
-    state.lastConnection = Date.now()
+
+    try {
+      // Enforce delay between connections to the same MX
+      const delay = this._jitteredDelay()
+      const now = Date.now()
+      const elapsed = now - state.lastConnection
+      if (elapsed < delay && state.lastConnection > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay - elapsed))
+      }
+      state.lastConnection = Date.now()
+    } catch (err) {
+      state.active--
+      if (state.queue.length > 0) {
+        const next = state.queue.shift()
+        next()
+      }
+      throw err
+    }
   }
 
   /** @param {string} domain */
@@ -188,8 +214,11 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
     return { ...baseResult, status: 'invalid' }
   }
 
-  if ([450, 451, 452].includes(responseCode)) {
-    logger.info(`[${email}] Temporarily unavailable (${responseCode})`)
+  // 4xx soft rejects often indicate throttling / greylisting / IP reputation
+  // issues. We log at `warn` level so they stand out in pm2 output — a spike
+  // here is the earliest signal that we need to slow down.
+  if ([421, 450, 451, 452].includes(responseCode)) {
+    logger.warn(`[${email}] SMTP soft reject (${responseCode}) from ${mxHost}: ${smtpResult.rawResponse}`)
     return { ...baseResult, status: 'unknown' }
   }
 
@@ -237,11 +266,24 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
 
 /**
  * Verify a batch of emails with concurrency control.
+ *
+ * Throttling defaults are tuned for IP-reputation safety over raw speed.
+ * Every knob is overridable via env var so you can tune in production
+ * without redeploying code:
+ *
+ *   MAX_CONCURRENCY          — global simultaneous SMTP probes (default 5)
+ *   MAX_PER_DOMAIN           — simultaneous probes per MX host (default 2)
+ *   DOMAIN_DELAY_MS          — nominal delay between probes to same MX (default 4000)
+ *   DOMAIN_DELAY_JITTER_PCT  — ±% randomization on that delay (default 0.25)
+ *
  * @param {string[]} emails
  * @param {object} [options]
  * @param {string} [options.ehloDomain]
  * @param {string} [options.mailFrom]
  * @param {number} [options.maxConcurrency]
+ * @param {number} [options.maxPerDomain]
+ * @param {number} [options.domainDelayMs]
+ * @param {number} [options.domainDelayJitterPct]
  * @param {typeof console} [options.logger]
  * @param {Map<string, boolean>} [options.catchAllDomainCache] - Shared across calls within one batch for per-domain catch-all memoization.
  * @returns {Promise<VerificationResult[]>}
@@ -250,13 +292,16 @@ export async function verifyEmails(emails, options = {}) {
   const {
     ehloDomain = process.env.EHLO_DOMAIN || 'mx-verify.com',
     mailFrom = process.env.MAIL_FROM_ADDRESS || 'verify@mx-verify.com',
-    maxConcurrency = parseInt(process.env.MAX_CONCURRENCY || '10', 10),
+    maxConcurrency = parseInt(process.env.MAX_CONCURRENCY || '5', 10),
+    maxPerDomain = parseInt(process.env.MAX_PER_DOMAIN || '2', 10),
+    domainDelayMs = parseInt(process.env.DOMAIN_DELAY_MS || '4000', 10),
+    domainDelayJitterPct = parseFloat(process.env.DOMAIN_DELAY_JITTER_PCT || '0.25'),
     logger = console,
     catchAllDomainCache,
   } = options
 
   const semaphore = new Semaphore(maxConcurrency)
-  const domainLimiter = new DomainLimiter(3, 2000)
+  const domainLimiter = new DomainLimiter(maxPerDomain, domainDelayMs, domainDelayJitterPct)
 
   const results = await Promise.all(
     emails.map((email) =>
