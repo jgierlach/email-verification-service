@@ -359,13 +359,19 @@ async function isCancelled(batchId, logger) {
  *
  * Tracks per-chunk timing into `metrics` for the final batch summary.
  *
+ * Per-email progress model: the batch counter (`validation_batches.processed`)
+ * and per-item status both commit *as each email resolves*, not at chunk
+ * boundaries. This is what drives live UI progress — without it, the progress
+ * bar would jump 50 at a time every ~75 seconds.
+ *
+ * @param {string} batchId
  * @param {Array<{ id: string, email: string, contact_ids: string[] }>} chunk
  * @param {Map<string, import('./verify.js').VerificationResult>} cacheMap
  * @param {ReturnType<typeof buildBatchCatchAllCache>} catchAllDomainCache
  * @param {BatchMetrics} metrics
  * @param {import('fastify').FastifyBaseLogger} logger
  */
-async function processChunk(chunk, cacheMap, catchAllDomainCache, metrics, logger) {
+async function processChunk(batchId, chunk, cacheMap, catchAllDomainCache, metrics, logger) {
   const chunkStart = Date.now()
 
   /** @type {Array<{ id: string, email: string, contact_ids: string[] }>} */
@@ -380,47 +386,113 @@ async function processChunk(chunk, cacheMap, catchAllDomainCache, metrics, logge
 
   const results = { processed: 0, cached: 0, verified: 0, failed: 0 }
 
-  // Fast path: committed DB-cache hits.
+  /**
+   * Commit one item + bump the batch counter by 1. Called from both the
+   * cache fast path and the per-email SMTP callback so the progress bar
+   * advances one row at a time regardless of which path served the result.
+   * @param {{ id: string, contact_ids: string[] }} item
+   * @param {string} vs - Verification status (valid/invalid/catch_all/unknown/risky)
+   * @param {'cache' | 'vps'} source
+   */
+  async function commitOne(item, vs, source) {
+    const { ok } = await commitItemResult(item.id, item.contact_ids, vs, undefined, logger)
+    await bumpBatchCounters(
+      batchId,
+      {
+        processed: 1,
+        cached: source === 'cache' && ok ? 1 : 0,
+        verified: source === 'vps' && ok ? 1 : 0,
+        failed: ok ? 0 : 1,
+      },
+      logger,
+    )
+    results.processed++
+    if (source === 'cache') {
+      metrics.emailsServedFromDbCache++
+      if (ok) results.cached++
+      else results.failed++
+    } else {
+      metrics.emailsVerifiedViaVps++
+      if (ok) results.verified++
+      else results.failed++
+    }
+    metrics.statusCounts[vs] = (metrics.statusCounts[vs] ?? 0) + 1
+  }
+
+  // Fast path: DB-cache hits commit per-email immediately.
   for (const item of fromCache) {
     const hit = cacheMap.get(normalizeEmail(item.email))
     const vs = toContactStatus(hit.status)
-    const { ok } = await commitItemResult(item.id, item.contact_ids, vs, undefined, logger)
-    results.processed++
-    if (ok) results.cached++
-    else results.failed++
-    metrics.emailsServedFromDbCache++
-    metrics.statusCounts[vs] = (metrics.statusCounts[vs] ?? 0) + 1
+    await commitOne(item, vs, 'cache')
   }
 
   if (fromVps.length > 0) {
     const smtpStart = Date.now()
-    const fresh = await verifyEmails(
-      fromVps.map((i) => i.email),
-      { logger, catchAllDomainCache },
-    )
-    metrics.smtpMsTotal += Date.now() - smtpStart
-
-    await cacheResults(fresh)
-
-    const byEmail = new Map(fresh.map((r) => [normalizeEmail(r.email), r]))
-
-    for (const item of fromVps) {
-      const r = byEmail.get(normalizeEmail(item.email))
-      if (!r) {
-        await commitItemResult(item.id, item.contact_ids, 'unknown', 'No result returned', logger)
-        results.processed++
-        results.failed++
-        metrics.statusCounts.unknown = (metrics.statusCounts.unknown ?? 0) + 1
-        continue
+    /** All batch rows per normalized address (same email can appear on multiple items). */
+    /** @type {Map<string, Array<{ id: string, email: string, contact_ids: string[] }>>} */
+    const itemsByEmail = new Map()
+    for (const i of fromVps) {
+      const key = normalizeEmail(i.email)
+      let list = itemsByEmail.get(key)
+      if (!list) {
+        list = []
+        itemsByEmail.set(key, list)
       }
-      const vs = toContactStatus(r.status)
-      const { ok } = await commitItemResult(item.id, item.contact_ids, vs, undefined, logger)
-      results.processed++
-      if (ok) results.verified++
-      else results.failed++
-      metrics.emailsVerifiedViaVps++
-      metrics.statusCounts[vs] = (metrics.statusCounts[vs] ?? 0) + 1
+      list.push(i)
     }
+
+    // One SMTP probe per unique address; onResult fans out to every item sharing that email.
+    const uniqueEmails = []
+    const seenKeys = new Set()
+    for (const i of fromVps) {
+      const key = normalizeEmail(i.email)
+      if (seenKeys.has(key)) continue
+      seenKeys.add(key)
+      uniqueEmails.push(i.email)
+    }
+
+    /** Cache-upsert batch: accumulate fresh results and flush once per chunk
+     *  to avoid hammering email_verifications with N single-row upserts. */
+    /** @type {import('./verify.js').VerificationResult[]} */
+    const fresh = []
+
+    const seenItemIds = new Set()
+    await verifyEmails(uniqueEmails, {
+      logger,
+      catchAllDomainCache,
+      onResult: async (r) => {
+        const key = normalizeEmail(r.email)
+        const items = itemsByEmail.get(key)
+        if (!items?.length) return
+        const vs = toContactStatus(r.status)
+        for (const item of items) {
+          try {
+            await commitOne(item, vs, 'vps')
+            seenItemIds.add(item.id)
+          } catch (err) {
+            logger.error(
+              { itemId: item.id, email: key, err: err instanceof Error ? err.message : String(err) },
+              '[batch-runner] commitOne failed for shared-address item',
+            )
+          }
+        }
+        fresh.push(r)
+      },
+    })
+
+    // Items never marked seen: no verify result, or verify succeeded but `onResult` failed
+    // before commit (e.g. DB error) — still need DB + counters so the batch can finalize.
+    for (const item of fromVps) {
+      if (seenItemIds.has(item.id)) continue
+      await commitItemResult(item.id, item.contact_ids, 'unknown', 'No result returned', logger)
+      await bumpBatchCounters(batchId, { processed: 1, cached: 0, verified: 0, failed: 1 }, logger)
+      results.processed++
+      results.failed++
+      metrics.statusCounts.unknown = (metrics.statusCounts.unknown ?? 0) + 1
+    }
+
+    metrics.smtpMsTotal += Date.now() - smtpStart
+    await cacheResults(fresh)
   }
 
   const chunkMs = Date.now() - chunkStart
@@ -490,8 +562,10 @@ export async function runBatch(batchId, logger) {
       const cached = await loadCached(emails)
       const cacheMap = new Map(cached.map((r) => [normalizeEmail(r.email), r]))
 
-      const deltas = await processChunk(chunk, cacheMap, catchAllDomainCache, metrics, logger)
-      await bumpBatchCounters(batchId, deltas, logger)
+      // processChunk now commits per-email AND bumps the batch counter per-email,
+      // so the progress bar advances one row at a time. No chunk-level bumpBatchCounters
+      // needed — that would double-count.
+      const deltas = await processChunk(batchId, chunk, cacheMap, catchAllDomainCache, metrics, logger)
 
       logger.info(
         {

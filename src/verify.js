@@ -286,6 +286,9 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
  * @param {number} [options.domainDelayJitterPct]
  * @param {typeof console} [options.logger]
  * @param {Map<string, boolean>} [options.catchAllDomainCache] - Shared across calls within one batch for per-domain catch-all memoization.
+ * @param {(result: VerificationResult) => void | Promise<void>} [options.onResult] -
+ *   Fires as each email completes (in whatever order they finish, not input order).
+ *   Lets callers commit per-email progress instead of waiting for the whole batch.
  * @returns {Promise<VerificationResult[]>}
  */
 export async function verifyEmails(emails, options = {}) {
@@ -298,14 +301,15 @@ export async function verifyEmails(emails, options = {}) {
     domainDelayJitterPct = parseFloat(process.env.DOMAIN_DELAY_JITTER_PCT || '0.25'),
     logger = console,
     catchAllDomainCache,
+    onResult,
   } = options
 
   const semaphore = new Semaphore(maxConcurrency)
   const domainLimiter = new DomainLimiter(maxPerDomain, domainDelayMs, domainDelayJitterPct)
 
   const results = await Promise.all(
-    emails.map((email) =>
-      verifySingle(email.trim().toLowerCase(), {
+    emails.map(async (email) => {
+      const result = await verifySingle(email.trim().toLowerCase(), {
         ehloDomain,
         mailFrom,
         semaphore,
@@ -313,7 +317,18 @@ export async function verifyEmails(emails, options = {}) {
         logger,
         catchAllDomainCache,
       })
-    )
+      if (onResult) {
+        try {
+          await onResult(result)
+        } catch (err) {
+          logger.error(
+            { email: result.email, err: err instanceof Error ? err.message : String(err) },
+            'onResult callback threw — swallowing so one failure does not tank the batch',
+          )
+        }
+      }
+      return result
+    })
   )
 
   return results
