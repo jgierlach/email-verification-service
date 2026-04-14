@@ -16,6 +16,13 @@ import {
   getEnrichmentBatchMetrics,
   recoverEnrichmentOnStartup,
 } from './enrichment-runner.js'
+import {
+  runSourcingJob,
+  cancelSourcingJob,
+  getSourcingJobStatus,
+  getSourcingJobMetrics,
+  recoverSourcingOnStartup,
+} from './sourcing-runner.js'
 import { supabaseEnabled } from './supabase.js'
 
 const PORT = parseInt(process.env.PORT || '3001', 10)
@@ -235,6 +242,69 @@ fastify.get('/enrichment-jobs/:id/metrics', async (request) => {
   return getEnrichmentBatchMetrics(id)
 })
 
+// ============================================================================
+// Sourcing job endpoints
+// ============================================================================
+
+/**
+ * POST /sourcing-jobs/:id/run
+ * Kick off a Google Places sourcing job. Returns 202 immediately — the VPS
+ * owns the job lifecycle from here, processing queries continuously until done.
+ */
+fastify.post('/sourcing-jobs/:id/run', async (request, reply) => {
+  if (!supabaseEnabled) {
+    return reply.code(500).send({ error: 'Sourcing runner not configured (missing SUPABASE env vars)' })
+  }
+  if (!process.env.GOOGLE_PLACES_API_KEY) {
+    return reply.code(500).send({ error: 'GOOGLE_PLACES_API_KEY not configured' })
+  }
+
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  if (!id) {
+    return reply.code(400).send({ error: 'Sourcing job id is required' })
+  }
+
+  runSourcingJob(id, fastify.log).catch((err) => {
+    fastify.log.error(
+      { jobId: id, err: err instanceof Error ? err.message : String(err) },
+      'Sourcing runner threw synchronously',
+    )
+  })
+
+  return reply.code(202).send({ job_id: id, status: 'accepted' })
+})
+
+/**
+ * POST /sourcing-jobs/:id/cancel
+ * Stop a running sourcing job. Sets status to `failed` in Supabase.
+ */
+fastify.post('/sourcing-jobs/:id/cancel', async (request, reply) => {
+  if (!supabaseEnabled) {
+    return reply.code(500).send({ error: 'Sourcing runner not configured' })
+  }
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  await cancelSourcingJob(id)
+  return { job_id: id, status: 'cancelled' }
+})
+
+/**
+ * GET /sourcing-jobs/:id/status
+ */
+fastify.get('/sourcing-jobs/:id/status', async (request, reply) => {
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  const result = await getSourcingJobStatus(id)
+  if (result.error) return reply.code(404).send(result)
+  return result
+})
+
+/**
+ * GET /sourcing-jobs/:id/metrics
+ */
+fastify.get('/sourcing-jobs/:id/metrics', async (request) => {
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  return getSourcingJobMetrics(id)
+})
+
 // Start server
 const start = async () => {
   try {
@@ -248,6 +318,10 @@ const start = async () => {
 
     recoverEnrichmentOnStartup(fastify.log).catch((err) => {
       fastify.log.error({ err: err instanceof Error ? err.message : String(err) }, 'Enrichment startup recovery threw')
+    })
+
+    recoverSourcingOnStartup(fastify.log).catch((err) => {
+      fastify.log.error({ err: err instanceof Error ? err.message : String(err) }, 'Sourcing startup recovery threw')
     })
   } catch (err) {
     fastify.log.error(err)
