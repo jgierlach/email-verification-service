@@ -1,4 +1,5 @@
 import Fastify from 'fastify'
+import secureJsonParse from 'secure-json-parse'
 import { verifyEmails } from './verify.js'
 import {
   runBatch,
@@ -21,6 +22,24 @@ const fastify = Fastify({
   },
 })
 
+// Fastify's default JSON parser throws FST_ERR_CTP_EMPTY_JSON_BODY when a
+// request advertises Content-Type: application/json but sends an empty body.
+// Some of our endpoints (POST /batches/:id/run, /cancel) take no body at all —
+// the ID in the URL is sufficient. Register a tolerant parser that treats an
+// empty/whitespace payload as an empty object. Use secure-json-parse (same
+// family Fastify uses by default) so prototype poisoning via `__proto__` /
+// `constructor` keys cannot slip through this custom path.
+fastify.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+  try {
+    const trimmed = typeof body === 'string' ? body.trim() : ''
+    if (trimmed === '') return done(null, {})
+    done(null, secureJsonParse(trimmed))
+  } catch (err) {
+    err.statusCode = 400
+    done(err, undefined)
+  }
+})
+
 // Bearer token authentication hook
 fastify.addHook('onRequest', async (request, reply) => {
   // Skip auth for health check
@@ -30,7 +49,7 @@ fastify.addHook('onRequest', async (request, reply) => {
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
 
   if (!API_TOKEN || token !== API_TOKEN) {
-    reply.code(401).send({ error: 'Unauthorized' })
+    return reply.code(401).send({ error: 'Unauthorized' })
   }
 })
 
