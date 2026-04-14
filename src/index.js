@@ -9,6 +9,13 @@ import {
   getProcessCacheSnapshot,
   recoverOnStartup,
 } from './batch-runner.js'
+import {
+  runEnrichmentBatch,
+  cancelEnrichmentBatch,
+  getEnrichmentBatchStatus,
+  getEnrichmentBatchMetrics,
+  recoverEnrichmentOnStartup,
+} from './enrichment-runner.js'
 import { supabaseEnabled } from './supabase.js'
 
 const PORT = parseInt(process.env.PORT || '3001', 10)
@@ -159,6 +166,75 @@ fastify.get('/cache/catch-all', async () => {
   return getProcessCacheSnapshot()
 })
 
+// ============================================================================
+// Enrichment batch endpoints
+// ============================================================================
+
+/**
+ * POST /enrichment-jobs/:id/run
+ * Kick off a long-running enrichment batch. Returns 202 immediately; the VPS
+ * owns the batch lifecycle from here — it claims pending items from Supabase,
+ * runs Hunter + Prospeo fallback per website, commits each result back.
+ */
+fastify.post('/enrichment-jobs/:id/run', async (request, reply) => {
+  if (!supabaseEnabled) {
+    return reply.code(500).send({ error: 'Enrichment runner not configured (missing SUPABASE env vars)' })
+  }
+  if (!process.env.HUNTER_API_KEY) {
+    return reply.code(500).send({ error: 'HUNTER_API_KEY not configured' })
+  }
+
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  if (!id) {
+    return reply.code(400).send({ error: 'Enrichment batch id is required' })
+  }
+
+  // Fire-and-forget — errors get logged by runEnrichmentBatch itself.
+  runEnrichmentBatch(id, fastify.log).catch((err) => {
+    fastify.log.error(
+      { batchId: id, err: err instanceof Error ? err.message : String(err) },
+      'Enrichment runner threw synchronously',
+    )
+  })
+
+  return reply.code(202).send({ batch_id: id, status: 'accepted' })
+})
+
+/**
+ * POST /enrichment-jobs/:id/cancel
+ * Stop a running enrichment batch. Sets status to `failed` in Supabase
+ * (the DB check constraint doesn't currently allow a distinct `cancelled` value).
+ */
+fastify.post('/enrichment-jobs/:id/cancel', async (request, reply) => {
+  if (!supabaseEnabled) {
+    return reply.code(500).send({ error: 'Enrichment runner not configured' })
+  }
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  await cancelEnrichmentBatch(id)
+  return { batch_id: id, status: 'cancelled' }
+})
+
+/**
+ * GET /enrichment-jobs/:id/status
+ * Read-only snapshot. Merges Supabase state with in-process presence.
+ */
+fastify.get('/enrichment-jobs/:id/status', async (request, reply) => {
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  const result = await getEnrichmentBatchStatus(id)
+  if (result.error) return reply.code(404).send(result)
+  return result
+})
+
+/**
+ * GET /enrichment-jobs/:id/metrics
+ * Live per-batch metrics while in-process; returns { in_process: false }
+ * after the batch finishes (the final summary is in the service logs).
+ */
+fastify.get('/enrichment-jobs/:id/metrics', async (request) => {
+  const { id } = /** @type {{ id: string }} */ (request.params)
+  return getEnrichmentBatchMetrics(id)
+})
+
 // Start server
 const start = async () => {
   try {
@@ -167,7 +243,11 @@ const start = async () => {
 
     // Reclaim stale items and auto-resume any in-flight batches after a restart.
     recoverOnStartup(fastify.log).catch((err) => {
-      fastify.log.error({ err: err instanceof Error ? err.message : String(err) }, 'Startup recovery threw')
+      fastify.log.error({ err: err instanceof Error ? err.message : String(err) }, 'Validation startup recovery threw')
+    })
+
+    recoverEnrichmentOnStartup(fastify.log).catch((err) => {
+      fastify.log.error({ err: err instanceof Error ? err.message : String(err) }, 'Enrichment startup recovery threw')
     })
   } catch (err) {
     fastify.log.error(err)
