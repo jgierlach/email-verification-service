@@ -1,4 +1,4 @@
-const SEARCH_URL = 'https://api.apollo.io/api/v1/mixed_people/search'
+const SEARCH_URL = 'https://api.apollo.io/api/v1/mixed_people/api_search'
 const BULK_MATCH_URL = 'https://api.apollo.io/api/v1/people/bulk_match'
 
 // Apollo accepts these lowercase seniority tokens. Override at runtime with
