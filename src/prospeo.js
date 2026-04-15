@@ -180,7 +180,7 @@ function buildContactRow(enrichResponse, searchResult) {
       email_mx_provider: person.email?.email_mx_provider || null,
       raw: enrichResponse,
     },
-    verification_status: 'valid',
+    verification_status: 'pending',
     is_decision_maker: true,
   }
 }

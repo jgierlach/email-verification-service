@@ -224,7 +224,7 @@ function buildContactRow(person) {
       email_status: person.email_status || null,
       confidence: person.extrapolated_email_confidence ?? null,
     },
-    verification_status: person.email_status === 'verified' ? 'valid' : 'pending',
+    verification_status: 'pending',
     is_decision_maker: isDecisionMakerTitle(title),
   }
 }
