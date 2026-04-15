@@ -1,5 +1,6 @@
 import { supabase, supabaseEnabled } from './supabase.js'
 import { prospeoFallbackEnrich, PROSPEO_COST_PER_CREDIT_USD } from './prospeo.js'
+import { apolloFallbackEnrich, APOLLO_COST_PER_CREDIT_USD } from './apollo.js'
 
 const CLAIM_LIMIT = 25
 const HUNTER_DELAY_MS = 1000
@@ -15,6 +16,10 @@ const WEBSITE_VALIDATION_TIMEOUT_MS = 8000
  * @property {number} prospeoRuns - times the fallback was invoked
  * @property {number} prospeoRescues - prospeo runs that yielded >= 1 contact
  * @property {number} prospeoCredits
+ * @property {number} apolloRuns - times the apollo fallback was invoked
+ * @property {number} apolloRescues - apollo runs that yielded >= 1 contact
+ * @property {number} apolloCredits - email reveals charged by apollo
+ * @property {number} apolloCandidatesFound - total people returned across apollo searches
  * @property {number} sitesDisqualified - failed website validation (unreachable / redirects)
  * @property {number} hunterCreditsUsed
  * @property {Record<string, number>} finalStatusCounts - e.g. enriched / enrichment_failed / disqualified
@@ -50,6 +55,10 @@ function newMetrics() {
     prospeoRuns: 0,
     prospeoRescues: 0,
     prospeoCredits: 0,
+    apolloRuns: 0,
+    apolloRescues: 0,
+    apolloCredits: 0,
+    apolloCandidatesFound: 0,
     sitesDisqualified: 0,
     hunterCreditsUsed: 0,
     finalStatusCounts: {},
@@ -335,6 +344,60 @@ async function runProspeoFallback(websiteId, domain, metrics, logger) {
 }
 
 /**
+ * Run Apollo fallback for a single website. Invoked only after both Hunter
+ * and Prospeo fail to produce any contacts. Logs to enrichment_log and
+ * persists returned contacts. Returns number of rows actually inserted.
+ *
+ * @param {string} websiteId
+ * @param {string} domain
+ * @param {EnrichmentMetrics} metrics
+ * @param {import('fastify').FastifyBaseLogger} logger
+ */
+async function runApolloFallback(websiteId, domain, metrics, logger) {
+  metrics.apolloRuns++
+
+  let result
+  try {
+    result = await apolloFallbackEnrich(domain, logger)
+  } catch (err) {
+    if (err.fatal) throw err
+    logger.error({ domain, err: err.message }, '[enrichment-runner] apollo fallback errored')
+    await supabase.from('enrichment_log').insert([{
+      website_id: websiteId,
+      step: 'apollo',
+      success: false,
+      contacts_found: 0,
+      credits_used: 0,
+      cost_usd: 0,
+      response_metadata: { error: err.message },
+    }])
+    return 0
+  }
+
+  const { inserted, insertErrors } = await insertContacts(websiteId, result.contacts, logger)
+  metrics.apolloCredits += result.creditsUsed
+  metrics.apolloCandidatesFound += result.candidatesFound
+  if (inserted > 0) metrics.apolloRescues++
+
+  await supabase.from('enrichment_log').insert([{
+    website_id: websiteId,
+    step: 'apollo',
+    success: inserted > 0,
+    contacts_found: inserted,
+    credits_used: result.creditsUsed,
+    cost_usd: Number((result.creditsUsed * APOLLO_COST_PER_CREDIT_USD).toFixed(4)),
+    response_metadata: {
+      candidates_found: result.candidatesFound,
+      reveals_attempted: result.revealsAttempted,
+      seniority_round_hit: result.seniorityRoundHit,
+      ...(insertErrors.length ? { insert_errors: insertErrors } : {}),
+    },
+  }])
+
+  return inserted
+}
+
+/**
  * Enrich a single batch item — validate website, Hunter lookup, Prospeo fallback,
  * persist contacts, write enrichment_log + sourced_websites status.
  *
@@ -425,24 +488,37 @@ async function processSingleItem(item, batchId, domain, metrics, logger) {
     prospeoInserted = await runProspeoFallback(item.website_id, domain, metrics, logger)
   }
 
-  const totalContacts = hunterInserted + prospeoInserted
+  // --- Step 5: Apollo fallback if Hunter and Prospeo produced zero contacts ---
+  let apolloInserted = 0
+  let apolloRan = false
+  if (hunterInserted === 0 && prospeoInserted === 0 && process.env.APOLLO_API_KEY) {
+    apolloRan = true
+    apolloInserted = await runApolloFallback(item.website_id, domain, metrics, logger)
+  }
+
+  const totalContacts = hunterInserted + prospeoInserted + apolloInserted
   metrics.totalContactsFound += totalContacts
   if (totalContacts > 0) metrics.itemsWithContacts++
 
-  // --- Step 5: Final status on the website ---
+  // --- Step 6: Final status on the website ---
   let newStatus
   let failureNote = null
   if (totalContacts > 0) {
     newStatus = 'enriched'
-    if (hunterInserted === 0 && prospeoInserted > 0) {
+    if (hunterInserted === 0 && prospeoInserted > 0 && apolloInserted === 0) {
       failureNote = `Enriched via Prospeo fallback (${prospeoInserted} contact${prospeoInserted === 1 ? '' : 's'})`
+    } else if (hunterInserted === 0 && prospeoInserted === 0 && apolloInserted > 0) {
+      failureNote = `Enriched via Apollo fallback (${apolloInserted} contact${apolloInserted === 1 ? '' : 's'})`
     }
   } else if (emails.length > 0) {
     newStatus = 'enrichment_storage_failed'
     failureNote = `Hunter returned ${emails.length} email(s) but all DB inserts failed`
   } else {
     newStatus = 'enrichment_failed'
-    failureNote = prospeoRan ? 'No emails found via Hunter or Prospeo' : 'No emails found for this domain'
+    const providersTried = ['Hunter']
+    if (prospeoRan) providersTried.push('Prospeo')
+    if (apolloRan) providersTried.push('Apollo')
+    failureNote = `No emails found via ${providersTried.join(', ')}`
   }
 
   const statusUpdate = { status: newStatus, updated_at: new Date().toISOString() }
@@ -491,16 +567,21 @@ async function processChunk(batchId, items, metrics, control, logger) {
       metrics.itemsProcessed++
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      /** Prospeo fatals (e.g. insufficient credits) are rethrown from runProspeoFallback — do not log as Hunter. */
-      const prospeoFatal = err instanceof Error && /** @type {Error & { fatal?: boolean }} */ (err).fatal === true
+      // Provider fatals (insufficient credits / bad key) are rethrown from the
+      // per-provider runners. Use the message prefix to attribute the error to
+      // the correct provider so enrichment_log reports the right step.
+      const isFatal = err instanceof Error && /** @type {Error & { fatal?: boolean }} */ (err).fatal === true
+      let provider = 'hunter'
+      if (isFatal && message.startsWith('Apollo')) provider = 'apollo'
+      else if (isFatal && message.startsWith('Prospeo')) provider = 'prospeo'
 
-      logger.error({ domain, err: message, prospeoFatal }, '[enrichment-runner] item failed')
+      logger.error({ domain, err: message, provider, isFatal }, '[enrichment-runner] item failed')
 
       await supabase
         .from('sourced_websites')
         .update({
           status: 'enrichment_failed',
-          notes: prospeoFatal ? `Prospeo error: ${message}` : `Hunter API error: ${message}`,
+          notes: provider === 'hunter' ? `Hunter API error: ${message}` : `${provider[0].toUpperCase()}${provider.slice(1)} error: ${message}`,
           updated_at: new Date().toISOString(),
         })
         .eq('id', item.website_id)
@@ -508,14 +589,12 @@ async function processChunk(batchId, items, metrics, control, logger) {
       const errCode = err instanceof Error && 'code' in err ? /** @type {Error & { code?: string }} */ (err).code : undefined
       await supabase.from('enrichment_log').insert([{
         website_id: item.website_id,
-        step: prospeoFatal ? 'prospeo' : 'hunter',
+        step: provider,
         success: false,
         contacts_found: 0,
-        credits_used: prospeoFatal ? 0 : 1,
+        credits_used: provider === 'hunter' ? 1 : 0,
         cost_usd: 0,
-        response_metadata: prospeoFatal
-          ? { error: message, ...(errCode ? { code: errCode } : {}) }
-          : { error: message },
+        response_metadata: { error: message, ...(errCode ? { code: errCode } : {}) },
       }])
 
       metrics.finalStatusCounts.enrichment_failed = (metrics.finalStatusCounts.enrichment_failed ?? 0) + 1
@@ -616,6 +695,7 @@ export async function runEnrichmentBatch(batchId, logger) {
 
     const elapsedMs = Date.now() - handle.startedAt
     const prospeoCost = Number((metrics.prospeoCredits * PROSPEO_COST_PER_CREDIT_USD).toFixed(4))
+    const apolloCost = Number((metrics.apolloCredits * APOLLO_COST_PER_CREDIT_USD).toFixed(4))
     logger.info(
       {
         batchId,
@@ -636,6 +716,13 @@ export async function runEnrichmentBatch(batchId, logger) {
           rescues: metrics.prospeoRescues,
           credits: metrics.prospeoCredits,
           estCostUsd: prospeoCost,
+        },
+        apollo: {
+          runs: metrics.apolloRuns,
+          rescues: metrics.apolloRescues,
+          credits: metrics.apolloCredits,
+          candidatesFound: metrics.apolloCandidatesFound,
+          estCostUsd: apolloCost,
         },
         sitesDisqualified: metrics.sitesDisqualified,
         finalStatusCounts: metrics.finalStatusCounts,
