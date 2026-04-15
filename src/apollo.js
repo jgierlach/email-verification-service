@@ -30,6 +30,33 @@ function sleep(ms) {
 }
 
 /**
+ * Pull the handful of response headers Apollo uses for rate-limit / credit
+ * reporting. Header presence depends on plan and endpoint — we best-effort
+ * capture whatever they send so the diagnostic logs can show remaining usage.
+ *
+ * @param {Headers} headers
+ */
+function extractApolloUsageHeaders(headers) {
+  const keys = [
+    'x-rate-limit-minute',
+    'x-minute-requests-left',
+    'x-rate-limit-hourly',
+    'x-hourly-requests-left',
+    'x-rate-limit-24-hour',
+    'x-24-hour-requests-left',
+    'x-rate-limit-remaining',
+    'x-rate-limit-credit-price',
+  ]
+  /** @type {Record<string, string>} */
+  const out = {}
+  for (const k of keys) {
+    const v = headers.get(k)
+    if (v != null) out[k] = v
+  }
+  return out
+}
+
+/**
  * POST JSON to an Apollo endpoint with retry + fatal-error detection.
  * Throws a `{ fatal: true, code }` error on insufficient credits / bad key,
  * matching the Prospeo client's contract so enrichment-runner can stop the
@@ -37,6 +64,7 @@ function sleep(ms) {
  *
  * @param {string} url
  * @param {object} body
+ * @returns {Promise<{ data: any, usage: Record<string, string> }>}
  */
 async function apolloFetch(url, body) {
   if (!process.env.APOLLO_API_KEY) {
@@ -112,7 +140,7 @@ async function apolloFetch(url, body) {
       throw err
     }
 
-    return data
+    return { data, usage: extractApolloUsageHeaders(response.headers) }
   }
 
   throw lastError || new Error('Apollo request failed')
@@ -138,10 +166,10 @@ export async function apolloSearchPeopleByDomain(domain, options = {}) {
   }
   if (seniorities.length > 0) body.person_seniorities = seniorities
 
-  const data = await apolloFetch(SEARCH_URL, body)
+  const { data, usage } = await apolloFetch(SEARCH_URL, body)
 
   const people = Array.isArray(data?.people) ? data.people : []
-  return { people }
+  return { people, usage, rawPagination: data?.pagination ?? null }
 }
 
 /**
@@ -154,7 +182,7 @@ export async function apolloSearchPeopleByDomain(domain, options = {}) {
  * @param {string} domain
  */
 export async function apolloBulkMatch(candidates, domain) {
-  if (candidates.length === 0) return { matches: [] }
+  if (candidates.length === 0) return { matches: [], usage: {}, raw: null }
 
   const details = candidates.map((p) => ({
     id: p.id,
@@ -164,14 +192,14 @@ export async function apolloBulkMatch(candidates, domain) {
     domain,
   }))
 
-  const data = await apolloFetch(BULK_MATCH_URL, {
+  const { data, usage } = await apolloFetch(BULK_MATCH_URL, {
     reveal_personal_emails: false,
     reveal_phone_number: false,
     details,
   })
 
   const matches = Array.isArray(data?.matches) ? data.matches : []
-  return { matches }
+  return { matches, usage, raw: data }
 }
 
 /** @param {string | null | undefined} title */
@@ -248,11 +276,15 @@ export async function apolloFallbackEnrich(domain, logger = console) {
   // --- Round 1: search with seniority filter ---
   let people = []
   let seniorityRoundHit = false
+  /** @type {Record<string, string>} */
+  let lastUsage = {}
 
   try {
     const senior = await apolloSearchPeopleByDomain(domain)
     people = senior.people
+    lastUsage = senior.usage || {}
     seniorityRoundHit = people.length > 0
+    logger.debug({ domain, count: people.length, usage: lastUsage }, '[apollo] round1 search done')
   } catch (err) {
     if (err.fatal) throw err
     logger.error({ domain, err: err.message }, '[apollo] round1 search errored')
@@ -263,6 +295,8 @@ export async function apolloFallbackEnrich(domain, logger = console) {
     try {
       const loose = await apolloSearchPeopleByDomain(domain, { seniorities: [] })
       people = loose.people
+      lastUsage = loose.usage || lastUsage
+      logger.debug({ domain, count: people.length, usage: lastUsage }, '[apollo] round2 search done')
     } catch (err) {
       if (err.fatal) throw err
       logger.error({ domain, err: err.message }, '[apollo] round2 search errored')
@@ -286,9 +320,19 @@ export async function apolloFallbackEnrich(domain, logger = console) {
     .filter((p) => p.email_status !== 'unavailable' && p.email_status !== 'not_found')
     .slice(0, MAX_REVEALS_PER_DOMAIN)
 
+  // Summarize candidate email_status distribution so we can see if Apollo is
+  // consistently returning only `unavailable` for a domain (= no reveal value
+  // even at max plan) vs returning real leads.
+  /** @type {Record<string, number>} */
+  const candidateStatuses = {}
+  for (const p of people) {
+    const s = p.email_status || 'null'
+    candidateStatuses[s] = (candidateStatuses[s] || 0) + 1
+  }
+
   if (revealable.length === 0) {
     logger.info(
-      { domain, candidates: people.length },
+      { domain, candidates: people.length, candidateStatuses },
       '[apollo] candidates found but all had unavailable email_status',
     )
     return {
@@ -301,24 +345,58 @@ export async function apolloFallbackEnrich(domain, logger = console) {
   }
 
   logger.info(
-    { domain, candidates: people.length, revealing: revealable.length, seniorityRoundHit },
+    { domain, candidates: people.length, revealing: revealable.length, candidateStatuses, seniorityRoundHit, usage: lastUsage },
     '[apollo] revealing emails via bulk_match',
   )
 
-  const { matches } = await apolloBulkMatch(revealable, domain)
+  const { matches, usage: matchUsage, raw: matchRaw } = await apolloBulkMatch(revealable, domain)
 
   const contacts = []
+  /** @type {Array<{ has_email: boolean, email_looks_unlocked: boolean, email_status: string | null, email_sample: string | null }>} */
+  const matchDiagnostics = []
   for (const match of matches) {
-    if (!isRevealedEmail(match.email)) continue
+    const hasEmail = !!match?.email
+    const looksUnlocked = hasEmail && isRevealedEmail(match.email)
+    matchDiagnostics.push({
+      has_email: hasEmail,
+      email_looks_unlocked: looksUnlocked,
+      email_status: match?.email_status ?? null,
+      // Sample only the part before @ so we don't log full PII at scale,
+      // and mask obvious obfuscation markers so the reason is visible.
+      email_sample: hasEmail ? String(match.email).replace(/@.+$/, '@…') : null,
+    })
+
+    if (!looksUnlocked) continue
     contacts.push(buildContactRow(match))
   }
 
-  // Apollo bills per email actually revealed; the match response only
-  // includes items it was willing to return data for.
+  // Apollo bills per email actually revealed. If Apollo returned `matches`
+  // but none had revealed emails (plan-gated or partial match), we want to
+  // see exactly what the response looked like so we can decide whether to
+  // keep calling bulk_match for this tier of leads.
   const creditsUsed = contacts.length
 
+  if (contacts.length === 0 && matches.length > 0) {
+    logger.warn(
+      {
+        domain,
+        candidates: people.length,
+        revealing: revealable.length,
+        matchesReturned: matches.length,
+        candidateStatuses,
+        matchDiagnostics,
+        matchUsage,
+        // Top-level shape only — avoid dumping full PII payloads.
+        rawKeys: matchRaw ? Object.keys(matchRaw) : null,
+        rawError: matchRaw?.error ?? null,
+        rawMessage: matchRaw?.message ?? null,
+      },
+      '[apollo] bulk_match returned matches but no revealed emails — inspect response',
+    )
+  }
+
   logger.info(
-    { domain, candidates: people.length, revealed: contacts.length, creditsUsed },
+    { domain, candidates: people.length, revealed: contacts.length, creditsUsed, usage: matchUsage },
     '[apollo] domain done',
   )
 
