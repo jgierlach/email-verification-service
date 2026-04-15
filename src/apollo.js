@@ -182,7 +182,9 @@ export async function apolloSearchPeopleByDomain(domain, options = {}) {
  * @param {string} domain
  */
 export async function apolloBulkMatch(candidates, domain) {
-  if (candidates.length === 0) return { matches: [], usage: {}, raw: null }
+  if (candidates.length === 0) {
+    return { matches: [], usage: {}, raw: null, creditsConsumed: 0, uniqueEnriched: 0, missing: 0 }
+  }
 
   const details = candidates.map((p) => ({
     id: p.id,
@@ -199,7 +201,13 @@ export async function apolloBulkMatch(candidates, domain) {
   })
 
   const matches = Array.isArray(data?.matches) ? data.matches : []
-  return { matches, usage, raw: data }
+  // Apollo returns an authoritative `credits_consumed` count per bulk_match
+  // call. Use it — our per-contact count is wrong because Apollo bills for
+  // the match attempt itself, not just the revealed-email output.
+  const creditsConsumed = Number.isFinite(data?.credits_consumed) ? data.credits_consumed : 0
+  const uniqueEnriched = Number.isFinite(data?.unique_enriched_records) ? data.unique_enriched_records : 0
+  const missing = Number.isFinite(data?.missing_records) ? data.missing_records : 0
+  return { matches, usage, raw: data, creditsConsumed, uniqueEnriched, missing }
 }
 
 /** @param {string | null | undefined} title */
@@ -314,10 +322,15 @@ export async function apolloFallbackEnrich(domain, logger = console) {
     }
   }
 
-  // Filter out candidates whose email Apollo already said is unavailable —
-  // no point burning a credit on a lookup that won't produce an email.
+  // Filter out candidates whose email Apollo can't provide. Empirically on
+  // the Basic plan, `email_status: null` almost always resolves to
+  // `unavailable` inside bulk_match AND Apollo still bills for the attempt,
+  // so we drop nulls here alongside explicit unavailable/not_found.
   const revealable = people
-    .filter((p) => p.email_status !== 'unavailable' && p.email_status !== 'not_found')
+    .filter((p) => {
+      const s = p.email_status
+      return s && s !== 'unavailable' && s !== 'not_found'
+    })
     .slice(0, MAX_REVEALS_PER_DOMAIN)
 
   // Summarize candidate email_status distribution so we can see if Apollo is
@@ -349,7 +362,14 @@ export async function apolloFallbackEnrich(domain, logger = console) {
     '[apollo] revealing emails via bulk_match',
   )
 
-  const { matches, usage: matchUsage, raw: matchRaw } = await apolloBulkMatch(revealable, domain)
+  const {
+    matches,
+    usage: matchUsage,
+    raw: matchRaw,
+    creditsConsumed,
+    uniqueEnriched,
+    missing,
+  } = await apolloBulkMatch(revealable, domain)
 
   const contacts = []
   /** @type {Array<{ has_email: boolean, email_looks_unlocked: boolean, email_status: string | null, email_sample: string | null }>} */
@@ -370,11 +390,9 @@ export async function apolloFallbackEnrich(domain, logger = console) {
     contacts.push(buildContactRow(match))
   }
 
-  // Apollo bills per email actually revealed. If Apollo returned `matches`
-  // but none had revealed emails (plan-gated or partial match), we want to
-  // see exactly what the response looked like so we can decide whether to
-  // keep calling bulk_match for this tier of leads.
-  const creditsUsed = contacts.length
+  // Apollo bills per bulk_match attempt (not per revealed email). Trust the
+  // `credits_consumed` field in the response over our client-side count.
+  const creditsUsed = creditsConsumed
 
   if (contacts.length === 0 && matches.length > 0) {
     logger.warn(
@@ -383,12 +401,15 @@ export async function apolloFallbackEnrich(domain, logger = console) {
         candidates: people.length,
         revealing: revealable.length,
         matchesReturned: matches.length,
+        creditsConsumed,
+        uniqueEnriched,
+        missing,
         candidateStatuses,
         matchDiagnostics,
         matchUsage,
         // Top-level shape only — avoid dumping full PII payloads.
         rawKeys: matchRaw ? Object.keys(matchRaw) : null,
-        rawError: matchRaw?.error ?? null,
+        rawError: matchRaw?.error ?? matchRaw?.error_message ?? null,
         rawMessage: matchRaw?.message ?? null,
       },
       '[apollo] bulk_match returned matches but no revealed emails — inspect response',
@@ -396,7 +417,15 @@ export async function apolloFallbackEnrich(domain, logger = console) {
   }
 
   logger.info(
-    { domain, candidates: people.length, revealed: contacts.length, creditsUsed, usage: matchUsage },
+    {
+      domain,
+      candidates: people.length,
+      revealed: contacts.length,
+      creditsUsed,
+      uniqueEnriched,
+      missing,
+      usage: matchUsage,
+    },
     '[apollo] domain done',
   )
 
