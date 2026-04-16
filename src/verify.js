@@ -49,8 +49,60 @@ class Semaphore {
 }
 
 /**
- * Per-domain rate limiter.
- * Enforces max concurrent connections and minimum delay between connections to the same MX.
+ * Shared-infrastructure buckets — multiple per-tenant MX hostnames that all
+ * route to the same provider's anti-abuse infrastructure get rolled up to a
+ * single bucket key. Without this, a batch hitting 200 different M365 tenants
+ * would create 200 independent per-MX limiters, each at maxPerDomain=2, while
+ * Microsoft's source-IP anti-abuse sees ~400 simultaneous connections from us.
+ *
+ * `key` is the synthetic bucket id used in DomainLimiter.domains.
+ * `maxPerDomain` and `delayMs` override the limiter's defaults for that bucket
+ * — Microsoft is the strictest receiver in the wild, so it gets aggressive
+ * throttling regardless of `MAX_PER_DOMAIN` / `DOMAIN_DELAY_MS` env settings.
+ *
+ * Math: 30s delay × 1 concurrent ≈ 120 RCPT/hour to Microsoft from this IP,
+ * comfortably under their ~50/hr soft-block threshold per IP.
+ *
+ * @type {Array<{ match: RegExp, key: string, maxPerDomain?: number, delayMs?: number }>}
+ */
+const SHARED_INFRA_BUCKETS = [
+  // Microsoft Office 365 / Exchange Online — strictest receiver. All M365
+  // tenants funnel through *.mail.protection.outlook.com or *.olc.protection.outlook.com.
+  { match: /(?:^|\.)(?:mail|olc)\.protection\.outlook\.com$/i, key: '__microsoft__', maxPerDomain: 1, delayMs: 30000 },
+  // Google Workspace + consumer Gmail. *.aspmx.l.google.com is the canonical
+  // Workspace MX; google.com / googlemail.com cover variants.
+  { match: /(?:^|\.)(?:aspmx\.l\.google|google|googlemail)\.com$/i, key: '__google__', maxPerDomain: 2, delayMs: 8000 },
+  // Yahoo + AOL.
+  { match: /(?:^|\.)yahoodns\.net$/i, key: '__yahoo__', maxPerDomain: 1, delayMs: 15000 },
+]
+
+/**
+ * Resolve an MX hostname to a (bucket-key, optional overrides) tuple. Unknown
+ * MXes pass through with the lowercased host as their bucket key — preserving
+ * existing per-MX behaviour for everything we don't explicitly group.
+ *
+ * @param {string} mxHost
+ */
+function resolveBucket(mxHost) {
+  if (!mxHost) return { key: '', overrideMax: null, overrideDelay: null }
+  const lower = mxHost.toLowerCase()
+  for (const b of SHARED_INFRA_BUCKETS) {
+    if (b.match.test(lower)) {
+      return {
+        key: b.key,
+        overrideMax: b.maxPerDomain ?? null,
+        overrideDelay: b.delayMs ?? null,
+      }
+    }
+  }
+  return { key: lower, overrideMax: null, overrideDelay: null }
+}
+
+/**
+ * Per-MX rate limiter with shared-infrastructure rollups. Caps concurrent
+ * connections and enforces a minimum delay between probes to the same bucket.
+ * Bucket = either the MX hostname itself or a synthetic key for shared
+ * infrastructure (Microsoft, Google, Yahoo) — see SHARED_INFRA_BUCKETS.
  */
 class DomainLimiter {
   /**
@@ -65,28 +117,33 @@ class DomainLimiter {
     this.jitterPct = jitterPct
     /**
      * @type {Map<string, { active: number, lastConnection: number, queue: Array<() => void> }>}
+     * Keyed by bucket id (MX host or shared-infra synthetic key).
      * `active` counts callers past the concurrency gate, including any awaiting the inter-connect delay.
      */
     this.domains = new Map()
   }
 
   /** Randomized delay within ±jitterPct of the nominal. */
-  _jitteredDelay() {
-    if (this.jitterPct <= 0) return this.delayMs
+  _jitteredDelay(baseDelay = this.delayMs) {
+    if (this.jitterPct <= 0) return baseDelay
     const factor = 1 + (Math.random() * 2 - 1) * this.jitterPct
-    return Math.max(0, Math.floor(this.delayMs * factor))
+    return Math.max(0, Math.floor(baseDelay * factor))
   }
 
-  /** @param {string} domain */
-  async acquire(domain) {
-    if (!this.domains.has(domain)) {
-      this.domains.set(domain, { active: 0, lastConnection: 0, queue: [] })
+  /** @param {string} mxHost */
+  async acquire(mxHost) {
+    const { key, overrideMax, overrideDelay } = resolveBucket(mxHost)
+    const maxPerDomain = overrideMax ?? this.maxPerDomain
+    const baseDelay = overrideDelay ?? this.delayMs
+
+    if (!this.domains.has(key)) {
+      this.domains.set(key, { active: 0, lastConnection: 0, queue: [] })
     }
 
-    const state = this.domains.get(domain)
+    const state = this.domains.get(key)
 
-    // Wait if at max concurrent "slots" for this domain (reserved before delay — see below).
-    while (state.active >= this.maxPerDomain) {
+    // Wait if at max concurrent "slots" for this bucket (reserved before delay — see below).
+    while (state.active >= maxPerDomain) {
       await new Promise((resolve) => {
         state.queue.push(resolve)
       })
@@ -98,8 +155,8 @@ class DomainLimiter {
     state.active++
 
     try {
-      // Enforce delay between connections to the same MX
-      const delay = this._jitteredDelay()
+      // Enforce delay between connections to the same bucket.
+      const delay = this._jitteredDelay(baseDelay)
       const now = Date.now()
       const elapsed = now - state.lastConnection
       if (elapsed < delay && state.lastConnection > 0) {
@@ -116,9 +173,10 @@ class DomainLimiter {
     }
   }
 
-  /** @param {string} domain */
-  release(domain) {
-    const state = this.domains.get(domain)
+  /** @param {string} mxHost */
+  release(mxHost) {
+    const { key } = resolveBucket(mxHost)
+    const state = this.domains.get(key)
     if (!state) return
 
     state.active--
@@ -272,9 +330,15 @@ async function verifySingle(email, { ehloDomain, mailFrom, semaphore, domainLimi
  * without redeploying code:
  *
  *   MAX_CONCURRENCY          — global simultaneous SMTP probes (default 5)
- *   MAX_PER_DOMAIN           — simultaneous probes per MX host (default 2)
- *   DOMAIN_DELAY_MS          — nominal delay between probes to same MX (default 4000)
+ *   MAX_PER_DOMAIN           — simultaneous probes per MX bucket (default 2)
+ *   DOMAIN_DELAY_MS          — nominal delay between probes to same bucket (default 4000)
  *   DOMAIN_DELAY_JITTER_PCT  — ±% randomization on that delay (default 0.25)
+ *
+ * Shared-infrastructure receivers (Microsoft 365, Google Workspace, Yahoo)
+ * are bucketed at the provider level — see SHARED_INFRA_BUCKETS above.
+ * Microsoft, in particular, gets aggressive overrides (1 concurrent / 30s
+ * delay) because their anti-abuse looks at source IP, not per-tenant. These
+ * overrides ignore the env knobs above on purpose.
  *
  * @param {string[]} emails
  * @param {object} [options]

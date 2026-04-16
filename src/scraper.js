@@ -46,6 +46,106 @@ const DENY_DOMAINS = [
 const EMAIL_REGEX = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi
 
 /**
+ * Conservative list of public TLDs we accept. Domains whose last segment isn't
+ * one of these (or doesn't start with one — see sanitizeEmail) are rejected.
+ * Listed in intentional order: generic first, then country-code, then newer
+ * gTLDs that matter for the current ICP. Sorted desc-by-length at use-time so
+ * prefix-matching picks the longest valid TLD first.
+ */
+const KNOWN_TLDS = [
+  // Generic
+  'com', 'org', 'net', 'edu', 'gov', 'mil', 'int', 'info', 'biz', 'name', 'pro', 'mobi',
+  // Country-code
+  'us', 'uk', 'ca', 'au', 'nz', 'ie', 'de', 'fr', 'es', 'it', 'nl', 'jp', 'cn', 'br', 'mx', 'eu', 'in', 'ru', 'za',
+  // Newer gTLDs common in small-biz / US ICP
+  'co', 'io', 'ai', 'app', 'dev', 'tech', 'me', 'tv', 'club', 'site', 'online', 'shop',
+  // Vertical gTLDs users actually register
+  'church', 'ministry', 'charity', 'community', 'foundation', 'care', 'school',
+  'health', 'center', 'academy', 'family', 'life', 'faith',
+  // Longer gTLDs whose labels share a prefix with a generic (e.g. `edu` in
+  // `education`, `com` in `communion`) — must be exact-listed; prefix-repair
+  // must not fire on lowercase continuations.
+  'communion', 'international', 'education',
+]
+const KNOWN_TLDS_BY_LENGTH = [...KNOWN_TLDS].sort((a, b) => b.length - a.length)
+
+/**
+ * After a known TLD prefix match on the last label, the remainder is only
+ * treated as glued junk (safe to strip) if it does NOT look like a normal
+ * DNS label continuation — e.g. `SubmitThanks` / `0ffice` / `-extra`, but
+ * not `munion` from `.communion` or `cation` from `.education`.
+ *
+ * @param {string} remainder - `lastLabel.slice(tld.length)`
+ */
+function looksLikeTldGlueTail(remainder) {
+  if (!remainder) return false
+  const ch = remainder[0]
+  return ch < 'a' || ch > 'z'
+}
+
+/**
+ * Salvage an extracted email string. Handles the three scraper failure modes:
+ *
+ *   1. Multiple `@` signs (broken mailto like `sc_tn@brotherhood@gmail.com`).
+ *   2. Trailing text concatenated to the TLD (`info@church.comSubmitThanks`
+ *      → `info@church.com`; `.org0ffice` → `.org`). Lowercase-only tails are
+ *      not stripped — avoids turning `@x.communion` into `@x.com`.
+ *   3. Placeholder / test addresses (`example@...`, `test@...`).
+ *
+ * Returns the sanitized email (lowercased) or null if unsalvageable.
+ *
+ * @param {string} raw
+ * @returns {string | null}
+ */
+function sanitizeEmail(raw) {
+  if (!raw) return null
+  const trimmed = raw.trim().replace(/^mailto:/i, '').split('?')[0]
+  if (!trimmed) return null
+
+  // Exactly one `@` — rejects `a@b@c` outright.
+  const parts = trimmed.split('@')
+  if (parts.length !== 2) return null
+  const [local, rawDomain] = parts
+  if (!local || !rawDomain) return null
+  if (local.length > 64) return null
+  if (!/^[A-Za-z0-9._%+\-]+$/.test(local)) return null
+
+  // Placeholder local-parts seen in template/copy-paste text. Tail `\d*$`
+  // catches numeric-suffixed variants like `example10`, `test3`.
+  if (/^(example|sample|yourname|youremail|yourmail|firstname|lastname|first\.last|placeholder|lorem|test)\d*$/i.test(local)) {
+    return null
+  }
+
+  const domain = rawDomain.toLowerCase()
+  if (!domain.includes('.')) return null
+  if (!/^[a-z0-9.\-]+$/.test(domain)) return null
+
+  const segments = domain.split('.')
+  const lastIdx = segments.length - 1
+  const lastSeg = segments[lastIdx]
+
+  // Fast path: last segment is an exact TLD match.
+  if (KNOWN_TLDS.includes(lastSeg)) {
+    return `${local.toLowerCase()}@${domain}`
+  }
+
+  // Repair path: last segment starts with a known TLD, then clearly glued junk
+  // (digit / uppercase / punctuation). Do NOT strip when the rest is plain
+  // lowercase — that is often a longer real TLD (`.communion`, `.education`).
+  // `.comSubmitThanks` → `.com`, `.org0ffice` → `.org`.
+  for (const tld of KNOWN_TLDS_BY_LENGTH) {
+    if (!lastSeg.startsWith(tld)) continue
+    const remainder = lastSeg.slice(tld.length)
+    if (!looksLikeTldGlueTail(remainder)) continue
+    const repaired = [...segments.slice(0, lastIdx), tld].join('.')
+    return `${local.toLowerCase()}@${repaired}`
+  }
+
+  // Unknown TLD prefix — reject.
+  return null
+}
+
+/**
  * Replace common in-text obfuscation tokens with their punctuation equivalent
  * before running the email regex. Covers the forms we actually see in small-
  * business websites: `[at]`, `(at)`, ` AT `, `[dot]`, etc.
@@ -204,11 +304,10 @@ function extractEmailsFromHtml(html, pageUrl) {
    * @param {'mailto' | 'text_regex' | 'deobfuscated'} method
    */
   function add(email, method) {
-    const clean = email.trim().replace(/^mailto:/i, '').split('?')[0]
+    const clean = sanitizeEmail(email)
     if (!clean) return
-    const lower = clean.toLowerCase()
-    if (byLower.has(lower)) return
-    byLower.set(lower, { email: clean, method, pageUrl })
+    if (byLower.has(clean)) return
+    byLower.set(clean, { email: clean, method, pageUrl })
   }
 
   // 1) mailto: hrefs (highest confidence)
