@@ -36,9 +36,10 @@ const DENY_PREFIX = [
 
 /** Domains that represent the hosting/platform, not the business. */
 const DENY_DOMAINS = [
-  'wix.com', 'wixsite.com', 'squarespace.com', 'godaddy.com', 'godaddysites.com',
+  'wix.com', 'wixsite.com', 'wixpress.com', // wixpress covers sentry.wixpress.com + sentry-next.wixpress.com DSN leaks
+  'squarespace.com', 'godaddy.com', 'godaddysites.com',
   'weebly.com', 'jimdo.com', 'jimdofree.com', 'myshopify.com',
-  'sentry.io', 'hubspot.com', 'wordpress.com', 'cloudflare.com',
+  'sentry.io', 'sentry-cdn.com', 'hubspot.com', 'wordpress.com', 'cloudflare.com',
   'example.com', 'test.com', 'domain.com', 'yourdomain.com', 'email.com',
 ]
 
@@ -67,16 +68,31 @@ function deobfuscate(text) {
 function isDenylisted(email) {
   const lower = email.toLowerCase()
   if (!lower.includes('@') || !lower.includes('.')) return true
+
   for (const p of DENY_PREFIX) {
     if (lower.startsWith(p)) return true
   }
+
   const at = lower.lastIndexOf('@')
+  const local = lower.slice(0, at)
   const emailDomain = lower.slice(at + 1)
+
   for (const d of DENY_DOMAINS) {
     if (emailDomain === d || emailDomain.endsWith(`.${d}`)) return true
   }
-  // reject addresses that look like filename/image refs
+
+  // Reject addresses that look like filename/image refs.
   if (/\.(png|jpg|jpeg|gif|svg|webp)$/.test(lower)) return true
+
+  // Consecutive dots are invalid per RFC 5321 and are a strong signal of
+  // tracking-token junk (e.g. Sentry DSN leaks). Real emails don't have `..`.
+  if (local.includes('..')) return true
+
+  // Long opaque local-parts with no separators (no `.`, `-`, `_`) are almost
+  // always telemetry tokens, not human addresses. Classic Sentry public-key
+  // DSNs look like `a1b2c3d4e5f6...@host` with 32+ hex chars.
+  if (local.length >= 32 && !/[._-]/.test(local)) return true
+
   return false
 }
 
