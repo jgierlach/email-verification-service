@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
+    "cheerio": "^1.0.0",
     "fastify": "^5.3.3",
     "secure-json-parse": "^4.1.0"
   }

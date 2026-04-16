@@ -1,10 +1,50 @@
 import { supabase, supabaseEnabled } from './supabase.js'
 import { prospeoFallbackEnrich, PROSPEO_COST_PER_CREDIT_USD } from './prospeo.js'
 import { apolloFallbackEnrich, APOLLO_COST_PER_CREDIT_USD } from './apollo.js'
+import { scrapeEmailsFromWebsite } from './scraper.js'
 
 const CLAIM_LIMIT = 25
 const HUNTER_DELAY_MS = 1000
 const WEBSITE_VALIDATION_TIMEOUT_MS = 8000
+
+/**
+ * Tier-1 platform subdomain patterns. These are shared website-builder /
+ * hosting domains where the business using them does NOT get a mailbox at
+ * that domain (Ueni/Wix/Weebly don't issue @yourbusiness.ueniweb.com emails),
+ * so Hunter and Prospeo have structurally zero chance of rescuing a contact.
+ * We short-circuit these to `disqualified` before burning a Hunter credit.
+ *
+ * Match rule: lowercase domain ends with `.suffix` (so `shop.example.com`
+ * doesn't false-positive on `example.com`).
+ */
+const PLATFORM_SUBDOMAIN_SUFFIXES = [
+  'ueniweb.com',
+  'localo.site',
+  'wixsite.com',
+  'weebly.com',
+  'godaddysites.com',
+  'business.site',
+  'squarespace.com',
+  'myshopify.com',
+  'webador.com',
+  'mystrikingly.com',
+  'webs.com',
+  'jimdofree.com',
+  'jimdo.com',
+]
+
+/**
+ * @param {string} domain
+ * @returns {string | null} The matched suffix, or null if domain is not on a known platform.
+ */
+function matchPlatformSubdomain(domain) {
+  if (!domain) return null
+  const lower = domain.toLowerCase()
+  for (const suffix of PLATFORM_SUBDOMAIN_SUFFIXES) {
+    if (lower.endsWith(`.${suffix}`)) return suffix
+  }
+  return null
+}
 
 /**
  * @typedef {object} EnrichmentMetrics
@@ -20,6 +60,10 @@ const WEBSITE_VALIDATION_TIMEOUT_MS = 8000
  * @property {number} apolloRescues - apollo runs that yielded >= 1 contact
  * @property {number} apolloCredits - email reveals charged by apollo
  * @property {number} apolloCandidatesFound - total people returned across apollo searches
+ * @property {number} scraperRuns - times the web scraper fallback was invoked
+ * @property {number} scraperRescues - scraper runs that yielded >= 1 contact
+ * @property {number} scraperPagesFetched - total pages fetched across all scraper runs
+ * @property {number} scraperEmailsFound - unique emails discovered before denylist
  * @property {number} sitesDisqualified - failed website validation (unreachable / redirects)
  * @property {number} hunterCreditsUsed
  * @property {Record<string, number>} finalStatusCounts - e.g. enriched / enrichment_failed / disqualified
@@ -59,6 +103,10 @@ function newMetrics() {
     apolloRescues: 0,
     apolloCredits: 0,
     apolloCandidatesFound: 0,
+    scraperRuns: 0,
+    scraperRescues: 0,
+    scraperPagesFetched: 0,
+    scraperEmailsFound: 0,
     sitesDisqualified: 0,
     hunterCreditsUsed: 0,
     finalStatusCounts: {},
@@ -398,6 +446,62 @@ async function runApolloFallback(websiteId, domain, metrics, logger) {
 }
 
 /**
+ * Run web scraper fallback for a single website. Invoked as the last resort
+ * after Hunter + Prospeo (+ Apollo if enabled) all fail to produce contacts.
+ * Zero API cost — just fetches the homepage + top contact-ish pages and
+ * extracts emails. Best-effort: errors never fail the domain.
+ *
+ * @param {string} websiteId
+ * @param {string} domain
+ * @param {EnrichmentMetrics} metrics
+ * @param {import('fastify').FastifyBaseLogger} logger
+ */
+async function runScraperFallback(websiteId, domain, metrics, logger) {
+  metrics.scraperRuns++
+
+  let result
+  try {
+    result = await scrapeEmailsFromWebsite(domain, {}, logger)
+  } catch (err) {
+    logger.error({ domain, err: err.message }, '[enrichment-runner] scraper fallback errored')
+    await supabase.from('enrichment_log').insert([{
+      website_id: websiteId,
+      step: 'scraper',
+      success: false,
+      contacts_found: 0,
+      credits_used: 0,
+      cost_usd: 0,
+      response_metadata: { error: err.message },
+    }])
+    return 0
+  }
+
+  metrics.scraperPagesFetched += result.pagesFetched
+  metrics.scraperEmailsFound += result.uniqueEmailsFound
+
+  const { inserted, insertErrors } = await insertContacts(websiteId, result.contacts, logger)
+  if (inserted > 0) metrics.scraperRescues++
+
+  await supabase.from('enrichment_log').insert([{
+    website_id: websiteId,
+    step: 'scraper',
+    success: inserted > 0,
+    contacts_found: inserted,
+    credits_used: 0,
+    cost_usd: 0,
+    response_metadata: {
+      pages_fetched: result.pagesFetched,
+      unique_emails_found: result.uniqueEmailsFound,
+      reason: result.reason,
+      elapsed_ms: result.elapsedMs,
+      ...(insertErrors.length ? { insert_errors: insertErrors } : {}),
+    },
+  }])
+
+  return inserted
+}
+
+/**
  * Enrich a single batch item — validate website, Hunter lookup, Prospeo fallback,
  * persist contacts, write enrichment_log + sourced_websites status.
  *
@@ -412,6 +516,38 @@ async function processSingleItem(item, batchId, domain, metrics, logger) {
     .from('sourced_websites')
     .update({ status: 'enriching', updated_at: new Date().toISOString() })
     .eq('id', item.website_id)
+
+  // --- Step 0: Platform-subdomain short-circuit ---
+  // Hosted website-builder subdomains can't have mailboxes at that domain,
+  // so Hunter+Prospeo will always return 0. Skip them before burning credits.
+  const platformMatch = matchPlatformSubdomain(domain)
+  if (platformMatch) {
+    const reason = `Hosted on ${platformMatch} — no mailbox exists at this domain`
+    await supabase
+      .from('sourced_websites')
+      .update({
+        status: 'disqualified',
+        notes: reason,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', item.website_id)
+
+    await supabase.from('enrichment_log').insert([{
+      website_id: item.website_id,
+      step: 'platform_prefilter',
+      success: false,
+      contacts_found: 0,
+      credits_used: 0,
+      cost_usd: 0,
+      response_metadata: { platform: platformMatch, domain },
+    }])
+
+    metrics.sitesDisqualified++
+    metrics.finalStatusCounts.disqualified = (metrics.finalStatusCounts.disqualified ?? 0) + 1
+    logger.info({ domain, platform: platformMatch }, '[enrichment-runner] platform subdomain — skipped')
+    await markItemDone(batchId, item.id, 'skipped', 0, reason, logger)
+    return
+  }
 
   // --- Step 1: Website validation ---
   const validation = await validateWebsite(domain)
@@ -496,19 +632,29 @@ async function processSingleItem(item, batchId, domain, metrics, logger) {
     apolloInserted = await runApolloFallback(item.website_id, domain, metrics, logger)
   }
 
-  const totalContacts = hunterInserted + prospeoInserted + apolloInserted
+  // --- Step 6: Web scraper fallback — zero-cost last resort ---
+  let scraperInserted = 0
+  let scraperRan = false
+  if (hunterInserted === 0 && prospeoInserted === 0 && apolloInserted === 0) {
+    scraperRan = true
+    scraperInserted = await runScraperFallback(item.website_id, domain, metrics, logger)
+  }
+
+  const totalContacts = hunterInserted + prospeoInserted + apolloInserted + scraperInserted
   metrics.totalContactsFound += totalContacts
   if (totalContacts > 0) metrics.itemsWithContacts++
 
-  // --- Step 6: Final status on the website ---
+  // --- Step 7: Final status on the website ---
   let newStatus
   let failureNote = null
   if (totalContacts > 0) {
     newStatus = 'enriched'
-    if (hunterInserted === 0 && prospeoInserted > 0 && apolloInserted === 0) {
+    if (hunterInserted === 0 && prospeoInserted > 0 && apolloInserted === 0 && scraperInserted === 0) {
       failureNote = `Enriched via Prospeo fallback (${prospeoInserted} contact${prospeoInserted === 1 ? '' : 's'})`
-    } else if (hunterInserted === 0 && prospeoInserted === 0 && apolloInserted > 0) {
+    } else if (hunterInserted === 0 && prospeoInserted === 0 && apolloInserted > 0 && scraperInserted === 0) {
       failureNote = `Enriched via Apollo fallback (${apolloInserted} contact${apolloInserted === 1 ? '' : 's'})`
+    } else if (hunterInserted === 0 && prospeoInserted === 0 && apolloInserted === 0 && scraperInserted > 0) {
+      failureNote = `Enriched via web scraper (${scraperInserted} contact${scraperInserted === 1 ? '' : 's'})`
     }
   } else if (emails.length > 0) {
     newStatus = 'enrichment_storage_failed'
@@ -518,6 +664,7 @@ async function processSingleItem(item, batchId, domain, metrics, logger) {
     const providersTried = ['Hunter']
     if (prospeoRan) providersTried.push('Prospeo')
     if (apolloRan) providersTried.push('Apollo')
+    if (scraperRan) providersTried.push('scraper')
     failureNote = `No emails found via ${providersTried.join(', ')}`
   }
 
@@ -723,6 +870,12 @@ export async function runEnrichmentBatch(batchId, logger) {
           credits: metrics.apolloCredits,
           candidatesFound: metrics.apolloCandidatesFound,
           estCostUsd: apolloCost,
+        },
+        scraper: {
+          runs: metrics.scraperRuns,
+          rescues: metrics.scraperRescues,
+          pagesFetched: metrics.scraperPagesFetched,
+          emailsFound: metrics.scraperEmailsFound,
         },
         sitesDisqualified: metrics.sitesDisqualified,
         finalStatusCounts: metrics.finalStatusCounts,
