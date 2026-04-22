@@ -1,4 +1,5 @@
 import { supabase, supabaseEnabled } from './supabase.js'
+import { hunterDomainSearch } from './hunter.js'
 import { prospeoFallbackEnrich, PROSPEO_COST_PER_CREDIT_USD } from './prospeo.js'
 import { apolloFallbackEnrich, APOLLO_COST_PER_CREDIT_USD } from './apollo.js'
 import { scrapeEmailsFromWebsite } from './scraper.js'
@@ -169,22 +170,6 @@ async function validateWebsite(domain) {
     }
     return { valid: false, reason: err.message }
   }
-}
-
-/**
- * Parse a Hunter API error response into a useful message.
- * @param {any} data
- * @param {number} status
- */
-function hunterApiErrorMessage(data, status) {
-  if (data && typeof data === 'object' && Array.isArray(data.errors) && data.errors.length > 0) {
-    const first = data.errors[0]
-    if (first && typeof first === 'object') {
-      if (typeof first.details === 'string') return first.details
-      if (typeof first.id === 'string') return first.id
-    }
-  }
-  return `Hunter API error ${status}`
 }
 
 /**
@@ -578,43 +563,56 @@ async function processSingleItem(item, batchId, domain, metrics, logger) {
   }
 
   // --- Step 2: Hunter domain search ---
-  const hunterUrl = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&api_key=${process.env.HUNTER_API_KEY}`
-  const response = await fetch(hunterUrl)
-  let data
-  try {
-    data = await response.json()
-  } catch {
-    throw new Error(`Hunter API ${response.status} ${response.statusText}`)
+  // Transient Hunter failures (5xx / network / rate-limit after retries)
+  // fall through to the Prospeo/Apollo/scraper chain rather than failing
+  // the item outright. Fatal errors (bad key / quota) still throw so the
+  // batch can halt.
+  const hunterResult = await hunterDomainSearch(domain)
+
+  let emails = []
+  let hunterInserted = 0
+  let hunterTransient = false
+
+  if (hunterResult.success === false) {
+    hunterTransient = true
+    logger.warn(
+      { domain, error: hunterResult.error },
+      '[enrichment-runner] Hunter transient failure — falling through to fallback providers',
+    )
+    await supabase.from('enrichment_log').insert([{
+      website_id: item.website_id,
+      step: 'hunter',
+      success: false,
+      contacts_found: 0,
+      credits_used: 0,
+      cost_usd: 0,
+      response_metadata: { error: hunterResult.error, transient: true },
+    }])
+  } else {
+    metrics.hunterCreditsUsed++
+    emails = hunterResult.data.data?.emails || []
+    if (emails.length > 0) metrics.hunterHits++
+    else metrics.hunterMisses++
+
+    // --- Step 3: Persist Hunter contacts ---
+    const hunterContactRows = emails.map(hunterEmailToContactRow)
+    const insertResult = await insertContacts(item.website_id, hunterContactRows, logger)
+    hunterInserted = insertResult.inserted
+    const insertErrors = insertResult.insertErrors
+
+    await supabase.from('enrichment_log').insert([{
+      website_id: item.website_id,
+      step: 'hunter',
+      success: hunterInserted > 0,
+      contacts_found: hunterInserted,
+      credits_used: 1,
+      cost_usd: 0,
+      response_metadata: {
+        emails_returned: emails.length,
+        ...(insertErrors.length ? { insert_errors: insertErrors } : {}),
+      },
+    }])
   }
-  if (!response.ok) {
-    throw new Error(hunterApiErrorMessage(data, response.status))
-  }
-
-  metrics.hunterCreditsUsed++
-  const emails = data.data?.emails || []
-  if (emails.length > 0) metrics.hunterHits++
-  else metrics.hunterMisses++
-
-  // --- Step 3: Persist Hunter contacts ---
-  const hunterContactRows = emails.map(hunterEmailToContactRow)
-  const { inserted: hunterInserted, insertErrors } = await insertContacts(
-    item.website_id,
-    hunterContactRows,
-    logger,
-  )
-
-  await supabase.from('enrichment_log').insert([{
-    website_id: item.website_id,
-    step: 'hunter',
-    success: hunterInserted > 0,
-    contacts_found: hunterInserted,
-    credits_used: 1,
-    cost_usd: 0,
-    response_metadata: {
-      emails_returned: emails.length,
-      ...(insertErrors.length ? { insert_errors: insertErrors } : {}),
-    },
-  }])
 
   // --- Step 4: Prospeo fallback if Hunter returned zero emails ---
   let prospeoInserted = 0
@@ -661,7 +659,7 @@ async function processSingleItem(item, batchId, domain, metrics, logger) {
     failureNote = `Hunter returned ${emails.length} email(s) but all DB inserts failed`
   } else {
     newStatus = 'enrichment_failed'
-    const providersTried = ['Hunter']
+    const providersTried = [hunterTransient ? 'Hunter (unavailable)' : 'Hunter']
     if (prospeoRan) providersTried.push('Prospeo')
     if (apolloRan) providersTried.push('Apollo')
     if (scraperRan) providersTried.push('scraper')
