@@ -406,6 +406,7 @@ function buildContactRow(hit, domain) {
  *   uniqueEmailsFound: number,
  *   elapsedMs: number,
  *   reason: 'ok' | 'no_contact_page' | 'fetch_failed' | 'timeout' | 'no_emails',
+ *   bestContactPageUrl: string | null,
  * }>}
  */
 export async function scrapeEmailsFromWebsite(domain, options = {}, logger = console) {
@@ -423,6 +424,7 @@ export async function scrapeEmailsFromWebsite(domain, options = {}, logger = con
       uniqueEmailsFound: 0,
       elapsedMs: Date.now() - startedAt,
       reason: 'fetch_failed',
+      bestContactPageUrl: null,
     }
   }
 
@@ -434,12 +436,18 @@ export async function scrapeEmailsFromWebsite(domain, options = {}, logger = con
       uniqueEmailsFound: 0,
       elapsedMs: Date.now() - startedAt,
       reason: 'fetch_failed',
+      bestContactPageUrl: null,
     }
   }
 
   /** @type {Map<string, { email: string, method: 'mailto' | 'text_regex' | 'deobfuscated', pageUrl: string }>} */
   const accumulated = new Map()
   let pagesFetched = 1
+  // Highest-scored contact-likely page that actually loaded. nextUrls is
+  // pre-sorted by score desc, so the first successful fetch is the best one.
+  // Captured even when the page yields zero emails — downstream form-fill
+  // discovery uses this to skip its own homepage crawl.
+  let bestContactPageUrl = null
 
   // Homepage always contributes.
   for (const hit of extractEmailsFromHtml(homepageHtml, homepageUrl)) {
@@ -452,6 +460,7 @@ export async function scrapeEmailsFromWebsite(domain, options = {}, logger = con
     const html = await fetchHtml(nextUrl, logger)
     if (!html) continue
     pagesFetched++
+    if (bestContactPageUrl === null) bestContactPageUrl = nextUrl
     for (const hit of extractEmailsFromHtml(html, nextUrl)) {
       if (!accumulated.has(hit.email.toLowerCase())) {
         accumulated.set(hit.email.toLowerCase(), hit)
@@ -491,5 +500,5 @@ export async function scrapeEmailsFromWebsite(domain, options = {}, logger = con
     '[scraper] domain done',
   )
 
-  return { contacts, pagesFetched, uniqueEmailsFound, elapsedMs, reason }
+  return { contacts, pagesFetched, uniqueEmailsFound, elapsedMs, reason, bestContactPageUrl }
 }

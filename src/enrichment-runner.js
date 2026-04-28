@@ -467,6 +467,25 @@ async function runScraperFallback(websiteId, domain, metrics, logger) {
   const { inserted, insertErrors } = await insertContacts(websiteId, result.contacts, logger)
   if (inserted > 0) metrics.scraperRescues++
 
+  // Piggyback: capture the highest-confidence contact page the scraper actually
+  // fetched, so the prospect form-fill discovery worker can skip its own
+  // homepage crawl. .is(null) guard means the form-fill worker's later
+  // (form-verified) write wins over this heuristic guess.
+  const homepageUrl = `https://${domain}`
+  if (result.bestContactPageUrl && result.bestContactPageUrl !== homepageUrl) {
+    const { error: contactUrlErr } = await supabase
+      .from('sourced_websites')
+      .update({ contact_page_url: result.bestContactPageUrl })
+      .eq('id', websiteId)
+      .is('contact_page_url', null)
+    if (contactUrlErr) {
+      logger.warn(
+        { websiteId, candidate: result.bestContactPageUrl, err: contactUrlErr.message },
+        '[enrichment-runner] failed to write contact_page_url',
+      )
+    }
+  }
+
   await supabase.from('enrichment_log').insert([{
     website_id: websiteId,
     step: 'scraper',
